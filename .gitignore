@@ -1,0 +1,15 @@
+# Python environments and bytecode
+.venv/
+__pycache__/
+*.py[cod]
+
+# Recorded test data and generated plots
+logs/
+*.csv
+*.png
+
+# Local build and editor artifacts
+build/
+.vscode/
+.idea/
+*.zip
