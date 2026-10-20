@@ -3,10 +3,11 @@
 
   HX711/load cell 1: DT GPIO4,  SCK GPIO5
   HX711/load cell 2: DT GPIO18, SCK GPIO19
+  MAUCH PL-100: current signal GPIO34, voltage signal GPIO35
 
   Wireless access point:
     SSID: ThrustStand
-    Password: thrust20kg
+    Password: set WIFI_PASSWORD locally before flashing
     TCP: 192.168.4.1:3333
 
   Set DEVICE_NUMBER to 1 before uploading ESP 1. Set it to 2 before
@@ -19,6 +20,12 @@
     INVERT         reverse both displayed force directions
     INFO           print configuration
     RESETCAL       erase both calibration factors
+    POWERINFO      print MAUCH electrical-sensor configuration
+    ZEROAMPS       capture zero-current ADC offset with motor off
+    ZEROVOLTS      capture zero-voltage ADC offset with battery disconnected
+    CALAMPS <A>    calibrate current against a DC clamp meter
+    CALVOLTS <V>   calibrate voltage against a DVM
+    RESETPOWER     erase electrical calibration
 */
 
 #include <Arduino.h>
@@ -31,7 +38,9 @@ constexpr uint32_t SERIAL_BAUD = 115200;
 constexpr uint8_t DEVICE_NUMBER = 1; // valid values: 1 (primary) or 2 (secondary)
 constexpr uint16_t TCP_PORT = 3333;
 constexpr char WIFI_SSID[] = "ThrustStand";
-constexpr char WIFI_PASSWORD[] = "thrust20kg";
+// Public-repository placeholder. Replace this locally with a private password
+// of at least eight characters before flashing either ESP32.
+constexpr char WIFI_PASSWORD[] = "CHANGE_ME_BEFORE_FLASHING";
 constexpr uint32_t HX_TIMEOUT_MS = 1500;
 constexpr size_t ZERO_SAMPLES = 20;
 constexpr size_t CAL_SAMPLES = 20;
@@ -40,6 +49,20 @@ constexpr double MIN_COUNTS_PER_KG = 1000.0;
 constexpr double STANDARD_GRAVITY = 9.80665;
 constexpr double NEWTONS_PER_LBF = 4.4482216152605;
 constexpr double EMA_ALPHA = 0.30;
+
+// MAUCH PL-100 integration. The sensor is connected to ESP 1 by default.
+// Its conditioned current output is 0.0-3.3 V for 0-100 A. The voltage
+// output is battery voltage divided by the board's configured divider.
+constexpr bool ENABLE_MAUCH_SENSOR = DEVICE_NUMBER == 1;
+constexpr uint8_t MAUCH_CURRENT_PIN = 34; // ADC1; safe while Wi-Fi is active
+constexpr uint8_t MAUCH_VOLTAGE_PIN = 35; // ADC1; safe while Wi-Fi is active
+constexpr double MAUCH_VOLTAGE_DIVIDER = 10.0; // solder bridge IN, max 33 V
+constexpr double DEFAULT_CURRENT_A_PER_COUNT = 100.0 / 4095.0;
+constexpr double DEFAULT_VOLTAGE_V_PER_COUNT =
+    (3.3 * MAUCH_VOLTAGE_DIVIDER) / 4095.0;
+constexpr double POWER_EMA_ALPHA = 0.20;
+constexpr uint32_t POWER_INTERVAL_MS = 50;      // 20 electrical samples/s
+constexpr uint8_t ADC_AVERAGE_SAMPLES = 16;
 
 struct LoadCell {
   uint8_t doutPin;
@@ -61,6 +84,13 @@ WiFiServer tcpServer(TCP_PORT);
 WiFiClient tcpClient;
 String serialCommand;
 String wifiCommand;
+uint32_t lastPowerSampleMs = 0;
+double filteredCurrentA = NAN;
+double filteredVoltageV = NAN;
+uint32_t currentZeroRaw = 0;
+uint32_t voltageZeroRaw = 0;
+double currentAperCount = DEFAULT_CURRENT_A_PER_COUNT;
+double voltageVperCount = DEFAULT_VOLTAGE_V_PER_COUNT;
 
 IPAddress networkIp() {
   return DEVICE_NUMBER == 1 ? WiFi.softAPIP() : WiFi.localIP();
@@ -131,6 +161,101 @@ void printInfo() {
         cells[1].doutPin, cells[1].sckPin, cells[1].zeroOffset, scale2.c_str());
   emitf("# INFO,device=%u,wifi_ssid=%s,wifi_ip=%s,tcp_port=%u",
         DEVICE_NUMBER, WIFI_SSID, networkIp().toString().c_str(), TCP_PORT);
+  emitf("# POWERINFO,enabled=%u,current_pin=%u,voltage_pin=%u,voltage_divider=%.6f,current_zero_raw=%lu,voltage_zero_raw=%lu,current_A_per_count=%.9f,voltage_V_per_count=%.9f",
+        ENABLE_MAUCH_SENSOR ? 1 : 0, MAUCH_CURRENT_PIN, MAUCH_VOLTAGE_PIN,
+        MAUCH_VOLTAGE_DIVIDER, currentZeroRaw, voltageZeroRaw,
+        currentAperCount, voltageVperCount);
+}
+
+uint32_t averageAdcRaw(uint8_t pin, uint16_t samples = ADC_AVERAGE_SAMPLES) {
+  uint32_t total = 0;
+  for (uint16_t i = 0; i < samples; ++i) total += analogRead(pin);
+  return total / samples;
+}
+
+void resetPowerFilters() {
+  filteredCurrentA = NAN;
+  filteredVoltageV = NAN;
+}
+
+void zeroPowerChannel(bool currentChannel) {
+  if (!ENABLE_MAUCH_SENSOR) {
+    emitLine("# ERROR,Electrical sensor is disabled on this ESP");
+    return;
+  }
+  const uint8_t pin = currentChannel ? MAUCH_CURRENT_PIN : MAUCH_VOLTAGE_PIN;
+  const uint32_t raw = averageAdcRaw(pin, 128);
+  if (currentChannel) {
+    currentZeroRaw = raw;
+    prefs.putUInt("izero", currentZeroRaw);
+    emitf("# STATUS,Current zero saved,current_zero_raw=%lu", currentZeroRaw);
+  } else {
+    voltageZeroRaw = raw;
+    prefs.putUInt("vzero", voltageZeroRaw);
+    emitf("# STATUS,Voltage zero saved,voltage_zero_raw=%lu", voltageZeroRaw);
+  }
+  resetPowerFilters();
+}
+
+void calibratePowerChannel(bool currentChannel, double referenceValue) {
+  const double maximum = currentChannel ? 100.0 : 60.0;
+  if (!ENABLE_MAUCH_SENSOR) {
+    emitLine("# ERROR,Electrical sensor is disabled on this ESP");
+    return;
+  }
+  if (!isfinite(referenceValue) || referenceValue <= 0.0 || referenceValue > maximum) {
+    emitf("# ERROR,%s reference must be greater than 0 and at most %.1f",
+          currentChannel ? "Current" : "Voltage", maximum);
+    return;
+  }
+  const uint8_t pin = currentChannel ? MAUCH_CURRENT_PIN : MAUCH_VOLTAGE_PIN;
+  const uint32_t zero = currentChannel ? currentZeroRaw : voltageZeroRaw;
+  const uint32_t raw = averageAdcRaw(pin, 128);
+  if (raw <= zero + 8) {
+    emitf("# ERROR,%s calibration signal is too close to zero; check wiring and reference load",
+          currentChannel ? "Current" : "Voltage");
+    return;
+  }
+  const double scale = referenceValue / static_cast<double>(raw - zero);
+  if (currentChannel) {
+    currentAperCount = scale;
+    prefs.putDouble("iscale", currentAperCount);
+    emitf("# STATUS,Current calibration saved,reference_A=%.5f,raw=%lu,A_per_count=%.9f",
+          referenceValue, raw, currentAperCount);
+  } else {
+    voltageVperCount = scale;
+    prefs.putDouble("vscale", voltageVperCount);
+    emitf("# STATUS,Voltage calibration saved,reference_V=%.5f,raw=%lu,V_per_count=%.9f",
+          referenceValue, raw, voltageVperCount);
+  }
+  resetPowerFilters();
+}
+
+void sampleElectricalPower() {
+  if (!ENABLE_MAUCH_SENSOR) return;
+  const uint32_t now = millis();
+  if (now - lastPowerSampleMs < POWER_INTERVAL_MS) return;
+  lastPowerSampleMs = now;
+
+  const uint32_t currentRaw = averageAdcRaw(MAUCH_CURRENT_PIN);
+  const uint32_t voltageRaw = averageAdcRaw(MAUCH_VOLTAGE_PIN);
+  const uint32_t correctedCurrentRaw = currentRaw > currentZeroRaw ? currentRaw - currentZeroRaw : 0;
+  const uint32_t correctedVoltageRaw = voltageRaw > voltageZeroRaw ? voltageRaw - voltageZeroRaw : 0;
+  double currentA = correctedCurrentRaw * currentAperCount;
+  double voltageV = correctedVoltageRaw * voltageVperCount;
+  if (currentA < 0.05) currentA = 0.0;
+  if (voltageV < 0.02) voltageV = 0.0;
+
+  if (!isfinite(filteredCurrentA)) filteredCurrentA = currentA;
+  else filteredCurrentA += POWER_EMA_ALPHA * (currentA - filteredCurrentA);
+  if (!isfinite(filteredVoltageV)) filteredVoltageV = voltageV;
+  else filteredVoltageV += POWER_EMA_ALPHA * (voltageV - filteredVoltageV);
+
+  const double powerW = voltageV * currentA;
+  const double filteredPowerW = filteredVoltageV * filteredCurrentA;
+  emitf("POWER,%lu,%lu,%lu,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f",
+        now, currentRaw, voltageRaw, currentA, voltageV, powerW,
+        filteredCurrentA, filteredVoltageV, filteredPowerW);
 }
 
 void tareAll() {
@@ -216,6 +341,27 @@ void handleCommand(String command) {
     invertDirection();
   } else if (upper == "I" || upper == "INFO") {
     printInfo();
+  } else if (upper == "POWERINFO") {
+    printInfo();
+  } else if (upper == "ZEROAMPS") {
+    zeroPowerChannel(true);
+  } else if (upper == "ZEROVOLTS") {
+    zeroPowerChannel(false);
+  } else if (upper.startsWith("CALAMPS ")) {
+    calibratePowerChannel(true, command.substring(8).toDouble());
+  } else if (upper.startsWith("CALVOLTS ")) {
+    calibratePowerChannel(false, command.substring(9).toDouble());
+  } else if (upper == "RESETPOWER") {
+    currentZeroRaw = 0;
+    voltageZeroRaw = 0;
+    currentAperCount = DEFAULT_CURRENT_A_PER_COUNT;
+    voltageVperCount = DEFAULT_VOLTAGE_V_PER_COUNT;
+    prefs.remove("izero");
+    prefs.remove("vzero");
+    prefs.remove("iscale");
+    prefs.remove("vscale");
+    resetPowerFilters();
+    emitLine("# STATUS,Electrical calibration reset to defaults");
   } else if (upper == "RESETCAL") {
     for (uint8_t i = 0; i < 2; ++i) {
       cells[i].countsPerKg = NAN;
@@ -224,7 +370,7 @@ void handleCommand(String command) {
     }
     emitLine("# STATUS,Both calibration factors erased");
   } else {
-    emitLine("# ERROR,Use TARE, CALLBF1 <lbf>, CALLBF2 <lbf>, INVERT, INFO, or RESETCAL");
+    emitLine("# ERROR,Use TARE, CALLBF1/2 <lbf>, INVERT, INFO, ZEROAMPS, ZEROVOLTS, CALAMPS <A>, CALVOLTS <V>, RESETPOWER, or RESETCAL");
   }
 }
 
@@ -275,6 +421,14 @@ void setup() {
   Serial.begin(SERIAL_BAUD);
   delay(700);
 
+  if (ENABLE_MAUCH_SENSOR) {
+    pinMode(MAUCH_CURRENT_PIN, INPUT);
+    pinMode(MAUCH_VOLTAGE_PIN, INPUT);
+    analogReadResolution(12);
+    analogSetPinAttenuation(MAUCH_CURRENT_PIN, ADC_11db);
+    analogSetPinAttenuation(MAUCH_VOLTAGE_PIN, ADC_11db);
+  }
+
   bool wifiReady = false;
   if (DEVICE_NUMBER == 1) {
     WiFi.mode(WIFI_AP);
@@ -301,6 +455,16 @@ void setup() {
   }
 
   prefs.begin("thrust-stand", false);
+  currentZeroRaw = prefs.getUInt("izero", 0);
+  voltageZeroRaw = prefs.getUInt("vzero", 0);
+  currentAperCount = prefs.getDouble("iscale", DEFAULT_CURRENT_A_PER_COUNT);
+  voltageVperCount = prefs.getDouble("vscale", DEFAULT_VOLTAGE_V_PER_COUNT);
+  if (!isfinite(currentAperCount) || currentAperCount <= 0.0) {
+    currentAperCount = DEFAULT_CURRENT_A_PER_COUNT;
+  }
+  if (!isfinite(voltageVperCount) || voltageVperCount <= 0.0) {
+    voltageVperCount = DEFAULT_VOLTAGE_V_PER_COUNT;
+  }
   // Migrate calibration made by the original single-cell firmware to cell 1.
   if (!prefs.isKey(cells[0].zeroKey) && prefs.isKey("zero")) {
     prefs.putLong64(cells[0].zeroKey, prefs.getLong64("zero", 0));
@@ -322,8 +486,11 @@ void setup() {
     }
   }
 
-  emitf("# THRUST_STAND_V5_DUAL_WIFI,device=%u", DEVICE_NUMBER);
+  emitf("# THRUST_STAND_V7_POWER_CAL,device=%u", DEVICE_NUMBER);
   emitLine("# COLUMNS,time_ms,raw1,raw2,kgf1,kgf2,total_kgf,total_force_N,filtered_total_force_N");
+  if (ENABLE_MAUCH_SENSOR) {
+    emitLine("# POWER_COLUMNS,time_ms,current_adc_raw,voltage_adc_raw,current_A,voltage_V,power_W,filtered_current_A,filtered_voltage_V,filtered_power_W");
+  }
   printInfo();
 
   for (uint8_t i = 0; i < 2; ++i) {
@@ -351,6 +518,7 @@ void setup() {
 void loop() {
   readCommands(Serial, serialCommand);
   serviceWifiClient();
+  sampleElectricalPower();
 
   int32_t raw[2] = {0, 0};
   bool received[2] = {false, false};

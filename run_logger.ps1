@@ -1,8 +1,11 @@
 param(
     [string]$Port = "COM7",
     [switch]$Wifi,
+    [switch]$Offline,
     [string]$WifiHost = "192.168.4.1",
-    [int]$TcpPort = 3333
+    [int]$TcpPort = 3333,
+    [int]$RefreshMs = 200,
+    [int]$MaxPlotPoints = 450
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,8 +32,10 @@ if (-not (Test-Path $Python)) {
     & $Python -m pip install -r (Join-Path $Project "logger\requirements.txt")
 }
 
-if ($Wifi) {
-    & $Python (Join-Path $Project "logger\realtime_logger.py") --wifi --host $WifiHost --tcp-port $TcpPort
+if ($Offline) {
+    & $Python (Join-Path $Project "logger\realtime_logger.py") --offline --refresh-ms $RefreshMs --max-plot-points $MaxPlotPoints
+} elseif ($Wifi) {
+    & $Python (Join-Path $Project "logger\realtime_logger.py") --wifi --host $WifiHost --tcp-port $TcpPort --refresh-ms $RefreshMs --max-plot-points $MaxPlotPoints
 } else {
-    & $Python (Join-Path $Project "logger\realtime_logger.py") --port $Port
+    & $Python (Join-Path $Project "logger\realtime_logger.py") --port $Port --refresh-ms $RefreshMs --max-plot-points $MaxPlotPoints
 }
