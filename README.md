@@ -199,12 +199,13 @@ The original ESP32 ADC becomes unreliable at the ends of its range. The session 
 
 ## Measurement notes
 
-- Each of the four load cells has a separate plot. The bottom plot sums every fresh, calibrated load cell. Faint lines are raw data and solid lines are filtered data.
+- Each of the four load cells has a separate lbf plot. The bottom plot sums every fresh, calibrated load cell. Faint lines are measured force in lbf and solid lines are smoothed force in lbf.
 - Every generated plot shows the maximum filtered value in its displayed interval: pounds-force for each calibrated load cell and total thrust, volts, amps, and watts. Saved PNGs calculate the corresponding maxima for the complete marked interval.
 - A missing, unpowered, or uncalibrated load cell is reported as `NaN`, bypassed automatically, and excluded from the combined total. The other load cells continue sampling normally.
-- If a cell is responding but has no calibration, its individual panel switches to **ADC counts (uncalibrated)** so wiring and sensor activity remain visible. ADC counts never contribute to the pounds-force total.
+- If a cell is responding but has no calibration, its lbf trace remains empty and the status reports **calibration required; no calibrated lbf data**. Raw ADC counts remain available in the CSV for diagnostics but are never graphed.
 - Upgrading from the original single-cell firmware automatically migrates its saved `zero` and `scale` values to load cell 1.
 - The CSV retains all four raw ADC counts, all four calibrated cell forces, and the available-cell total.
+- This plot-only behavior does not tare, reset, or modify the ESP32's nonvolatile load-cell calibration or zero offsets.
 - The CSV uses `record_type=thrust` or `record_type=electrical`. Electrical rows include raw ADC counts, current, voltage, instantaneous power, and their filtered values.
 - GPIO34 and GPIO35 are ADC1 inputs, so they continue working while ESP32 Wi-Fi is active. The firmware averages 16 ADC readings and publishes electrical data at 20 samples/s.
 - The default 10 SPS mode is good for static measurements but may miss fast thrust peaks. If the HX711 module exposes a RATE pad/jumper, set RATE high for 80 SPS and restart. Many boards require a solder-jumper modification—verify the board markings first.

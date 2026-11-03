@@ -98,16 +98,21 @@ class SessionTests(unittest.TestCase):
             "DATA,100,123,0,0,0,1.0,nan,nan,nan,1.0,9.80665,9.0".split(","))
         self.session._process_sample(self.source, time.monotonic(), sample, [])
         self.assertTrue(math.isfinite(self.session.total_values[-1]))
-        self.assertEqual(self.source.cell_units[0], "Thrust (lbf)")
-        self.assertIsNone(self.source.cell_units[1])
+        self.assertAlmostEqual(self.source.cells[0][-1], 2.20462262, places=6)
+        self.assertFalse(self.source.cells[1])
 
     def test_uncalibrated_counts_never_enter_force_total(self):
         sample = parse_sample(
             "DATA,100,123,456,789,321,nan,nan,nan,nan,nan,nan,nan".split(","))
-        self.session._process_sample(self.source, time.monotonic(), sample, [])
-        self.assertEqual(
-            self.source.cell_units,
-            ["ADC counts (uncalibrated)"] * 4)
+        statuses = []
+        self.session._process_sample(
+            self.source, time.monotonic(), sample, statuses)
+        self.assertTrue(all(not values for values in self.source.cells))
+        self.assertTrue(all(not values for values in self.source.filtered_cells))
+        self.assertEqual(len(statuses), 4)
+        self.assertTrue(all(
+            "calibration required; no calibrated lbf data" in status
+            for status in statuses))
         self.assertTrue(math.isnan(self.session.total_values[-1]))
 
     def test_commands_preserve_firmware_protocol(self):

@@ -41,8 +41,7 @@ def render_dashboard(session: ThrustStandSession, recorded: bool = False) -> Fig
     source = session.sources[0] if session.sources else None
     for cell_index in range(CELL_COUNT):
         axis = figure.add_subplot(grid[cell_index, 0])
-        unit = (source.cell_units[cell_index] if source else None) or "Thrust (lbf)"
-        _style(axis, f"Load cell {cell_index + 1}", unit)
+        _style(axis, f"Load cell {cell_index + 1}", "Thrust (lbf)")
         if source:
             times = (source.record_cell_times[cell_index] if recorded
                      else source.cell_times[cell_index])
@@ -51,12 +50,12 @@ def render_dashboard(session: ThrustStandSession, recorded: bool = False) -> Fig
             filtered = (source.record_filtered_cells[cell_index] if recorded
                         else source.filtered_cells[cell_index])
             axis.plot(times, raw, color=CELL_COLORS[cell_index], alpha=0.35,
-                      linewidth=0.9, label="Raw")
+                      linewidth=0.9, label="Measured (lbf)")
             axis.plot(times, filtered, color=CELL_COLORS[cell_index],
-                      linewidth=2.0, label="Filtered")
+                      linewidth=2.0, label="Smoothed (lbf)")
             if times:
                 axis.legend(loc="upper left")
-            peak = _finite_max(filtered) if unit == "Thrust (lbf)" else None
+            peak = _finite_max(filtered)
             if peak is not None:
                 axis.text(0.99, 0.96, f"Max: {peak:.3f} lbf",
                           transform=axis.transAxes, ha="right", va="top")
@@ -69,9 +68,9 @@ def render_dashboard(session: ThrustStandSession, recorded: bool = False) -> Fig
     _style(total_axis, "Total thrust — all fresh calibrated cells", "Thrust (lbf)")
     total_axis.set_xlabel("Computer time (s)")
     total_axis.plot(total_times, total_raw, color="#555555", alpha=0.35,
-                    linewidth=0.9, label="Combined raw")
+                    linewidth=0.9, label="Combined measured (lbf)")
     total_axis.plot(total_times, total_filtered, color="#111111",
-                    linewidth=2.2, label="Combined filtered")
+                    linewidth=2.2, label="Combined smoothed (lbf)")
     if total_times:
         total_axis.legend(loc="upper left")
     peak = _finite_max(total_filtered)

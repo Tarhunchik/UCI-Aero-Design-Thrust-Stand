@@ -148,11 +148,7 @@ class SourceState:
         default_factory=lambda: [deque() for _ in range(CELL_COUNT)])
     filtered_cells: list[deque[float]] = field(
         default_factory=lambda: [deque() for _ in range(CELL_COUNT)])
-    cell_units: list[str | None] = field(
-        default_factory=lambda: [None] * CELL_COUNT)
     filter_state: list[float] = field(
-        default_factory=lambda: [math.nan] * CELL_COUNT)
-    force_filter_state: list[float] = field(
         default_factory=lambda: [math.nan] * CELL_COUNT)
     latest_cells: list[float] = field(
         default_factory=lambda: [math.nan] * CELL_COUNT)
@@ -346,18 +342,12 @@ class ThrustStandSession:
             float(sample[f"raw{index + 1}"]) for index in range(CELL_COUNT)]
         filtered_displayed = [math.nan] * CELL_COUNT
         for index, force in enumerate(forces):
-            if source.cell_units[index] is None:
-                if math.isfinite(force):
-                    source.cell_units[index] = "Thrust (lbf)"
-                elif counts[index] != 0.0:
-                    source.cell_units[index] = "ADC counts (uncalibrated)"
-                    message = f"{source.label} cell {index + 1}: calibration required for lbf"
-                    self.status_messages.append(message)
-                    statuses.append(message)
-            value = (
-                force if source.cell_units[index] == "Thrust (lbf)" else
-                counts[index] if source.cell_units[index] == "ADC counts (uncalibrated)"
-                and counts[index] != 0.0 else math.nan)
+            value = force if math.isfinite(force) else math.nan
+            if not math.isfinite(value) and counts[index] != 0.0:
+                message = (f"{source.label} cell {index + 1}: "
+                           "calibration required; no calibrated lbf data")
+                self.status_messages.append(message)
+                statuses.append(message)
             if math.isfinite(value):
                 previous = source.filter_state[index]
                 filtered_displayed[index] = (
@@ -367,14 +357,8 @@ class ThrustStandSession:
                 source.cell_times[index].append(elapsed)
                 source.cells[index].append(value)
                 source.filtered_cells[index].append(filtered_displayed[index])
-            if math.isfinite(force):
-                previous_force = source.force_filter_state[index]
-                filtered_force = (
-                    force if not math.isfinite(previous_force)
-                    else previous_force + EMA_ALPHA * (force - previous_force))
-                source.force_filter_state[index] = filtered_force
-                source.latest_cells[index] = force
-                source.latest_filtered_cells[index] = filtered_force
+                source.latest_cells[index] = value
+                source.latest_filtered_cells[index] = filtered_displayed[index]
                 source.latest_cell_times[index] = host_mono
             if self.recording and math.isfinite(value):
                 source.record_cell_times[index].append(host_mono - self.record_started_mono)
